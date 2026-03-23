@@ -54,7 +54,16 @@ def find_omr_region(img):
     return (0, 0, w, h)
 
 
-def detect_bubbles_in_column(img, col_x, col_y, col_w, col_h, num_rows=50, num_options=4):
+def detect_bubbles_in_column(
+    img,
+    col_x,
+    col_y,
+    col_w,
+    col_h,
+    num_rows=50,
+    num_options=4,
+    allow_multi=False,
+):
     """
     Detect filled bubbles in a single column of the OMR sheet.
     Returns list of detected answers (0=A, 1=B, 2=C, 3=D, -1=unattempted, -2=multiple)
@@ -82,22 +91,29 @@ def detect_bubbles_in_column(img, col_x, col_y, col_w, col_h, num_rows=50, num_o
                 darknesses.append(255)
                 continue
             
-            _, cell_thresh = cv2.threshold(cell, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            filled_ratio = np.sum(cell_thresh > 0) / cell_thresh.size
+            pad_y = max(1, int(cell.shape[0] * 0.15))
+            pad_x = max(1, int(cell.shape[1] * 0.15))
+            inner = cell[pad_y:-pad_y, pad_x:-pad_x]
+            if inner.size == 0:
+                inner = cell
+
+            _, cell_thresh = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            filled_ratio = float(np.sum(cell_thresh > 0)) / float(cell_thresh.size)
             darknesses.append(filled_ratio)
         
-        max_dark = max(darknesses)
-        
-        if max_dark < 0.08:
+        ranked = sorted(enumerate(darknesses), key=lambda x: x[1], reverse=True)
+        (best_idx, best_val) = ranked[0]
+        second_val = ranked[1][1] if len(ranked) > 1 else 0.0
+
+        min_fill = 0.10
+        multi_similarity = 0.85
+
+        if best_val < min_fill:
             answers.append(-1)
+        elif allow_multi and second_val >= best_val * multi_similarity and second_val >= min_fill:
+            answers.append(-2)
         else:
-            filled = [i for i, d in enumerate(darknesses) if d > max_dark * 0.5 and d > 0.08]
-            if len(filled) == 0:
-                answers.append(-1)
-            elif len(filled) == 1:
-                answers.append(filled[0])
-            else:
-                answers.append(-2)
+            answers.append(best_idx)
     
     return answers
 
@@ -129,7 +145,7 @@ def auto_detect_columns(img):
     return columns
 
 
-def process_omr_image(image_input, num_rows=50, num_options=4):
+def process_omr_image(image_input, num_rows=50, num_options=4, allow_multi=False):
     """
     Main function to process an OMR image and extract answers.
     Returns dict with answers for each column.
@@ -155,7 +171,9 @@ def process_omr_image(image_input, num_rows=50, num_options=4):
         
         answers = detect_bubbles_in_column(
             img, col_x, col_y, col_w, col_h,
-            num_rows=num_rows, num_options=num_options
+            num_rows=num_rows,
+            num_options=num_options,
+            allow_multi=allow_multi,
         )
         results[f"col_{col_idx + 1}"] = answers
     

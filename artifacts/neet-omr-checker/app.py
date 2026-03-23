@@ -13,6 +13,10 @@ from io import BytesIO
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import sys
+import importlib.util
+
+from dotenv import load_dotenv
 
 from omr_processor import process_omr_image, visualize_detection, preprocess_image
 from neet_scorer import (
@@ -22,12 +26,17 @@ from ai_analyzer import (
     analyze_with_gemini, analyze_with_openrouter, get_available_openrouter_models
 )
 
-UPLOAD_DIR = "uploads"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.abspath(os.path.join(APP_DIR, "..", ".."))
+load_dotenv(dotenv_path=os.path.join(REPO_DIR, ".env"))
+
+UPLOAD_DIR = os.path.join(APP_DIR, "uploads")
 BLANK_OMR_DIR = os.path.join(UPLOAD_DIR, "blank")
 ANSWER_KEY_DIR = os.path.join(UPLOAD_DIR, "answer_key")
 STUDENT_DIR = os.path.join(UPLOAD_DIR, "student")
 ANSWER_KEY_JSON = os.path.join(ANSWER_KEY_DIR, "answer_key.json")
 BLANK_OMR_FILE = os.path.join(BLANK_OMR_DIR, "blank_omr.jpg")
+SAMPLE_OMR_FILE = os.path.join(APP_DIR, "sample_omr.jpeg")
 
 for d in [BLANK_OMR_DIR, ANSWER_KEY_DIR, STUDENT_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -57,8 +66,8 @@ def get_blank_omr():
     """Load blank OMR file if exists."""
     if os.path.exists(BLANK_OMR_FILE):
         return BLANK_OMR_FILE
-    if os.path.exists("sample_omr.jpeg"):
-        return "sample_omr.jpeg"
+    if os.path.exists(SAMPLE_OMR_FILE):
+        return SAMPLE_OMR_FILE
     return None
 
 
@@ -77,9 +86,29 @@ def render_answer_table(answers_dict, title="Answers"):
     st.dataframe(df, use_container_width=True, height=400)
 
 
+def _get_secret_or_env(key: str):
+    return os.getenv(key)
+
+
+def _resolve_ai_api_key(provider: str, typed_key: str):
+    if typed_key:
+        return typed_key
+    if provider == "Gemini":
+        return _get_secret_or_env("GEMINI_API_KEY")
+    if provider == "OpenRouter":
+        return _get_secret_or_env("OPENROUTER_API_KEY")
+    return None
+
+
+def _resolve_openrouter_model(typed_model: str | None):
+    if typed_model:
+        return typed_model
+    return _get_secret_or_env("OPENROUTER_MODEL") or "google/gemini-flash-1.5"
+
+
 def plot_score_breakdown(report):
-    """Create score breakdown chart."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    """Plot score breakdown chart."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
     col_marks = [col['total_marks'] for col in report['columns']]
     col_labels = ['Physics\n(Col 1)', 'Chemistry\n(Col 2)', 'Botany\n(Col 3)', 'Zoology\n(Col 4)']
@@ -170,6 +199,11 @@ def teacher_panel():
     """Teacher panel for uploading blank OMR and answer key."""
     st.header("Teacher Panel")
     st.markdown("Upload the blank OMR sheet for students to download, and set the answer key.")
+
+    with st.sidebar:
+        gemini_available = importlib.util.find_spec("google.generativeai") is not None
+        st.caption(f"Python: {sys.executable}")
+        st.caption(f"Gemini SDK: {'OK' if gemini_available else 'Missing'}")
     
     with st.expander("Step 1: Upload Blank OMR Sheet", expanded=True):
         col1, col2 = st.columns([2, 1])
@@ -188,7 +222,7 @@ def teacher_panel():
         with col2:
             blank_path = get_blank_omr()
             if blank_path:
-                st.image(blank_path, caption="Current Blank OMR", use_container_width=True)
+                st.image(blank_path, caption="Current Blank OMR", use_column_width=True)
                 st.download_button(
                     label="Download Blank OMR",
                     data=open(blank_path, 'rb').read(),
@@ -214,41 +248,44 @@ def teacher_panel():
             )
             
             if answer_key_file:
-                st.image(answer_key_file, caption="Answer Key OMR", use_container_width=True)
+                st.image(answer_key_file, caption="Answer Key OMR", use_column_width=True)
                 answer_key_file.seek(0)
                 
                 col_a, col_b = st.columns(2)
                 with col_a:
                     use_ai = st.checkbox("Use AI for better accuracy", value=False)
-                
+
                 if use_ai:
                     ai_provider = st.selectbox("AI Provider", ["Gemini", "OpenRouter"])
-                    api_key = st.text_input(f"{ai_provider} API Key", type="password")
-                    
+
                     if ai_provider == "OpenRouter":
                         model_choice = st.selectbox("Model", get_available_openrouter_models())
                 
                 if st.button("Process Answer Key OMR", type="primary"):
                     with st.spinner("Processing answer key..."):
                         answer_key_file.seek(0)
-                        
-                        if use_ai and api_key:
+                        resolved_key = _resolve_ai_api_key(ai_provider, "") if use_ai else None
+                        resolved_model = _resolve_openrouter_model(model_choice) if (use_ai and ai_provider == "OpenRouter") else None
+
+                        if use_ai and resolved_key:
                             answer_key_file.seek(0)
                             pil_img = Image.open(answer_key_file)
                             
                             if ai_provider == "Gemini":
-                                answers = analyze_with_gemini(pil_img, api_key)
+                                answers = analyze_with_gemini(pil_img, resolved_key)
                             else:
-                                answers = analyze_with_openrouter(pil_img, api_key, model_choice)
+                                answers = analyze_with_openrouter(pil_img, resolved_key, resolved_model)
                             
                             if 'error' in answers:
                                 st.error(f"AI Error: {answers['error']}")
                                 st.info("Falling back to traditional detection...")
                                 answer_key_file.seek(0)
-                                answers = process_omr_image(answer_key_file)
+                                answers = process_omr_image(answer_key_file, allow_multi=False)
                         else:
+                            if use_ai and not resolved_key:
+                                st.warning(f"{ai_provider} API key was not found in .env. Falling back to traditional detection.")
                             answer_key_file.seek(0)
-                            answers = process_omr_image(answer_key_file)
+                            answers = process_omr_image(answer_key_file, allow_multi=False)
                         
                         save_answer_key(answers)
                         st.session_state['answer_key'] = answers
@@ -260,7 +297,7 @@ def teacher_panel():
                         answer_key_file.seek(0)
                         img = Image.open(answer_key_file)
                         vis = visualize_detection(img, answers)
-                        st.image(vis, caption="Detected Bubbles", use_container_width=True)
+                        st.image(vis, caption="Detected Bubbles", use_column_width=True)
         
         with tab_manual:
             st.markdown("Enter answers for each column (A/B/C/D for each question):")
@@ -324,7 +361,7 @@ def student_panel():
         if blank_path:
             col1, col2 = st.columns([1, 2])
             with col1:
-                st.image(blank_path, caption="Blank OMR Sheet", use_container_width=True)
+                st.image(blank_path, caption="Blank OMR Sheet", use_column_width=True)
             with col2:
                 st.markdown("""
                 ### Instructions:
@@ -344,7 +381,6 @@ def student_panel():
                         data=f.read(),
                         file_name="neet_blank_omr.jpg",
                         mime="image/jpeg",
-                        use_container_width=True
                     )
         else:
             st.error("No blank OMR sheet available. Please contact your teacher.")
@@ -362,7 +398,7 @@ def student_panel():
         )
         
         if student_file:
-            st.image(student_file, caption="Your OMR Sheet", use_container_width=True)
+            st.image(student_file, caption="Your OMR Sheet", use_column_width=True)
             student_file.seek(0)
             
             st.markdown("### AI Enhancement (Optional)")
@@ -375,32 +411,37 @@ def student_panel():
             ai_answers = None
             if use_ai:
                 ai_provider = st.selectbox("Select AI Provider", ["Gemini", "OpenRouter"], key="student_ai_provider")
-                api_key = st.text_input(f"{ai_provider} API Key", type="password", key="student_api_key")
-                
+
                 if ai_provider == "OpenRouter":
                     model_choice = st.selectbox("Model", get_available_openrouter_models(), key="student_model")
                 else:
                     model_choice = None
-                
-                if api_key:
+
+                resolved_key = _resolve_ai_api_key(ai_provider, "")
+                if resolved_key:
                     st.info("AI analysis will run when you click 'Check My OMR'")
+                else:
+                    st.warning(f"{ai_provider} API key was not found in .env. AI analysis will be skipped.")
             
-            if st.button("Check My OMR", type="primary", use_container_width=True):
+            if st.button("Check My OMR", type="primary"):
                 with st.spinner("Analyzing your OMR sheet..."):
                     student_file.seek(0)
                     pil_img = Image.open(student_file)
                     
-                    cv_answers = process_omr_image(pil_img)
+                    cv_answers = process_omr_image(pil_img, allow_multi=False)
                     
                     final_answers = cv_answers
                     detection_method = "Traditional CV"
                     
-                    if use_ai and api_key:
+                    resolved_key = _resolve_ai_api_key(ai_provider, "") if use_ai else None
+                    resolved_model = _resolve_openrouter_model(model_choice) if (use_ai and ai_provider == "OpenRouter") else None
+
+                    if use_ai and resolved_key:
                         with st.spinner("Running AI analysis for better accuracy..."):
                             if ai_provider == "Gemini":
-                                ai_answers = analyze_with_gemini(pil_img, api_key)
+                                ai_answers = analyze_with_gemini(pil_img, resolved_key)
                             else:
-                                ai_answers = analyze_with_openrouter(pil_img, api_key, model_choice)
+                                ai_answers = analyze_with_openrouter(pil_img, resolved_key, resolved_model)
                             
                             if 'error' not in ai_answers:
                                 final_answers = ai_answers
@@ -468,26 +509,36 @@ def show_results(report, detected_answers, method, student_name="", roll_number=
     
     st.subheader("Subject-wise Breakdown")
     subjects = ['Physics', 'Chemistry', 'Botany', 'Zoology']
-    
-    for col_idx, (col_result, subject) in enumerate(zip(report['columns'], subjects)):
-        exp_label = f"**{subject}** (Col {col_result['col_num']}) — {col_result['total_marks']} marks"
-        
-        with st.expander(exp_label):
+
+    subject_tabs = st.tabs(
+        [
+            f"{subject} (Col {col_result['col_num']})"
+            for col_result, subject in zip(report['columns'], subjects)
+        ]
+    )
+
+    for tab, (col_result, subject) in zip(subject_tabs, zip(report['columns'], subjects)):
+        with tab:
+            st.markdown(f"### {subject} — {col_result['total_marks']} marks")
             sub_col1, sub_col2, sub_col3 = st.columns(3)
-            
+
             with sub_col1:
-                st.metric("Mandatory Section", 
-                         f"{col_result['mandatory_correct']} correct",
-                         f"{col_result['mandatory_wrong']} wrong")
-            
+                st.metric(
+                    "Mandatory Section",
+                    f"{col_result['mandatory_correct']} correct",
+                    f"{col_result['mandatory_wrong']} wrong",
+                )
+
             with sub_col2:
                 st.metric("Mandatory Unattempted", col_result['mandatory_unattempted'])
-            
+
             with sub_col3:
-                st.metric("Optional Counted", 
-                         f"{col_result['optional_counted']}/10",
-                         f"{col_result['optional_correct']} correct")
-            
+                st.metric(
+                    "Optional Counted",
+                    f"{col_result['optional_counted']}/10",
+                    f"{col_result['optional_correct']} correct",
+                )
+
             q_data = []
             for q in col_result['questions']:
                 q_num_display = q['q_num']
@@ -499,10 +550,10 @@ def show_results(report, detected_answers, method, student_name="", roll_number=
                     'not_counted': '🔵',
                     'multiple_marked_not_counted': '🔵',
                 }.get(q['status'], '❓')
-                
+
                 section = 'Mandatory' if q['section'] == 'mandatory' else 'Optional'
                 counted = '✓' if q.get('counted', True) else '✗ (not counted)'
-                
+
                 q_data.append({
                     'Q#': q_num_display,
                     'Section': section,
@@ -510,9 +561,9 @@ def show_results(report, detected_answers, method, student_name="", roll_number=
                     'Correct': answer_index_to_letter(q['correct_answer']),
                     'Status': f"{status_emoji} {q['status'].replace('_', ' ').title()}",
                     'Marks': q['marks'],
-                    'Counted': counted
+                    'Counted': counted,
                 })
-            
+
             df = pd.DataFrame(q_data)
             st.dataframe(df, use_container_width=True, height=300)
     
@@ -533,7 +584,7 @@ def show_results(report, detected_answers, method, student_name="", roll_number=
     with tab3:
         if student_image:
             vis_img = visualize_detection(student_image, detected_answers)
-            st.image(vis_img, caption="Detected Bubbles (Green=detected)", use_container_width=True)
+            st.image(vis_img, caption="Detected Bubbles (Green=detected)", use_column_width=True)
         st.markdown("**Detected Answers:**")
         render_answer_table(detected_answers, "Detected Answers")
     
@@ -678,8 +729,8 @@ def main():
     st.markdown("*Automated OMR checking with AI-enhanced accuracy for NEET exam sheets*")
     
     with st.sidebar:
-        st.image("sample_omr.jpeg" if os.path.exists("sample_omr.jpeg") else [], 
-                 use_container_width=True)
+        st.image(SAMPLE_OMR_FILE if os.path.exists(SAMPLE_OMR_FILE) else [], 
+                 use_column_width=True)
         st.markdown("---")
         st.markdown("### Navigation")
         
